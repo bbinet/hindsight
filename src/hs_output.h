@@ -18,7 +18,7 @@ typedef struct hs_output
   FILE* fh;
   char* path;
   pthread_mutex_t lock;
-  size_t id;
+  unsigned long long id;
   size_t offset;
 } hs_output;
 

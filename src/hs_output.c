@@ -72,7 +72,7 @@ void hs_open_output_file(hs_output* output)
     fclose(output->fh);
     output->fh = NULL;
   }
-  int ret = snprintf(fqfn, sizeof(fqfn), "%s/%zu.log", output->path,
+  int ret = snprintf(fqfn, sizeof(fqfn), "%s/%llu.log", output->path,
                      output->id);
   if (ret < 0 || ret > (int)sizeof(fqfn) - 1) {
     hs_log(g_module, 0, "output filename exceeds %zu", sizeof(fqfn));

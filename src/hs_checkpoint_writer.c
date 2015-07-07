@@ -139,7 +139,7 @@ void hs_write_checkpoints(hs_checkpoint_writer* cpw, hs_checkpoint_reader* cpr)
 
   if (cpw->analysis_plugins) {
     long offset = 0;
-    size_t id = 0;
+    unsigned long long id = 0;
     pthread_mutex_lock(&cpw->analysis_plugins->cp_lock);
     id = cpw->analysis_plugins->cp_id;
     offset = cpw->analysis_plugins->cp_offset;

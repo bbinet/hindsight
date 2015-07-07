@@ -23,9 +23,9 @@ typedef struct hs_input_buffer
 {
   unsigned char* buf;
   char* name;
+  unsigned long long id;
   size_t namesize;
   size_t bufsize;
-  size_t id;
   size_t offset;
   size_t readpos;
   size_t scanpos;
@@ -48,7 +48,7 @@ void hs_init_input_buffer(hs_input_buffer* b, size_t max_message_size);
 void hs_free_input_buffer(hs_input_buffer* b);
 bool hs_expand_input_buffer(hs_input_buffer* b, size_t len);
 
-int hs_open_file(hs_input* hsi, const char* subdir, size_t id);
+int hs_open_file(hs_input* hsi, const char* subdir, unsigned long long id);
 
 size_t hs_read_file(hs_input* hsi);
 
