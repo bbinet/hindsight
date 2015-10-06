@@ -407,7 +407,7 @@ static void analyze_message(hs_analysis_thread* at)
       ret = hs_timer_event(sb->lsb, at->current_t, false);
       clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts1);
       hs_update_running_stats(&sb->stats.te, hs_timespec_delta(&ts, &ts1));
-      sb->next_timer_event = at->current_t + sb->ticker_interval;
+      sb->next_timer_event = sb->next_timer_event + sb->ticker_interval;
     }
 
     if (ret > 0) terminate_sandbox(at, i);

@@ -50,6 +50,7 @@ static const char* cfg_sb_instruction = "instruction_limit";
 static const char* cfg_sb_preserve = "preserve_data";
 static const char* cfg_sb_filename = "filename";
 static const char* cfg_sb_ticker_interval = "ticker_interval";
+static const char* cfg_sb_ticker_sync = "ticker_sync";
 static const char* cfg_sb_thread = "thread";
 static const char* cfg_sb_async_buffer = "async_buffer_size";
 static const char* cfg_sb_matcher = "message_matcher";
@@ -67,6 +68,7 @@ static void init_sandbox_config(hs_sandbox_config* cfg)
   cfg->custom_config = NULL;
   cfg->message_matcher = NULL;
   cfg->ticker_interval = 0;
+  cfg->ticker_sync = 0;
   cfg->thread = 0;
   cfg->async_buffer_size = 0;
 }
@@ -210,6 +212,9 @@ static int load_sandbox_defaults(lua_State* L,
   if (get_numeric_item(L, 1, cfg_sb_ticker_interval, &cfg->ticker_interval)) {
     return 1;
   }
+  if (get_numeric_item(L, 1, cfg_sb_ticker_sync, &cfg->ticker_sync)) {
+    return 1;
+  }
   if (get_bool_item(L, 1, cfg_sb_preserve, &cfg->preserve_data)) return 1;
 
   if (check_for_unknown_options(L, 1, key)) return 1;
@@ -301,6 +306,7 @@ bool hs_load_sandbox_config(const char* dir,
     cfg->memory_limit = dflt->memory_limit;
     cfg->instruction_limit = dflt->instruction_limit;
     cfg->ticker_interval = dflt->ticker_interval;
+    cfg->ticker_sync = dflt->ticker_sync;
     cfg->preserve_data = dflt->preserve_data;
   }
 
@@ -331,6 +337,10 @@ bool hs_load_sandbox_config(const char* dir,
 
   ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_sb_ticker_interval,
                          &cfg->ticker_interval);
+  if (ret) goto cleanup;
+
+  ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_sb_ticker_sync,
+                         &cfg->ticker_sync);
   if (ret) goto cleanup;
 
   ret = get_string_item(L, LUA_GLOBALSINDEX, cfg_sb_filename, &cfg->filename,

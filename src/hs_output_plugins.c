@@ -313,7 +313,7 @@ static int output_message(hs_output_plugin* p)
     hs_update_running_stats(&p->sb->stats.te, delta);
     pthread_mutex_unlock(&p->cp_lock);
 
-    p->sb->next_timer_event = current_t + p->sb->ticker_interval;
+    p->sb->next_timer_event = p->sb->next_timer_event + p->sb->ticker_interval;
   }
 
   if (ret > 0 || te_ret > 0) {

@@ -153,9 +153,20 @@ hs_sandbox* hs_create_sandbox(void* parent,
 
   sb->ticker_interval = sbc->ticker_interval;
   int stagger = sbc->ticker_interval > 60 ? 60 : sbc->ticker_interval;
+  time_t now = time(NULL);
   // distribute when the timer_events will fire
   if (stagger) {
-    sb->next_timer_event = time(NULL) + rand() % stagger;
+    switch (sbc->ticker_sync) {
+    case 1: // sync ticker_interval on epoch number
+      sb->next_timer_event = now + sbc->ticker_interval - now % sbc->ticker_interval;
+      break;
+    case 2: // don't sync ticker_interval: use current time
+      sb->next_timer_event = now + sbc->ticker_interval;
+      break;
+    default: // random sync (the default)
+      sb->next_timer_event = now + rand() % stagger;
+      break;
+    }
   }
 
   sb->lsb = lsb_create_custom(parent, fqfn, lsb_config);
