@@ -41,6 +41,7 @@ static const char *cfg_io_lua_cpath = "io_lua_cpath";
 static const char *cfg_max_message_size = "max_message_size";
 static const char *cfg_hostname = "hostname";
 static const char *cfg_backpressure = "backpressure";
+static const char *cfg_load_interval = "sandbox_load_interval";
 
 static const char *cfg_sb_ipd = "input_defaults";
 static const char *cfg_sb_apd = "analysis_defaults";
@@ -51,6 +52,7 @@ static const char *cfg_sb_instruction = "instruction_limit";
 static const char *cfg_sb_preserve = "preserve_data";
 static const char *cfg_sb_filename = "filename";
 static const char *cfg_sb_ticker_interval = "ticker_interval";
+static const char *cfg_sb_ticker_sync = "ticker_sync";
 static const char *cfg_sb_thread = "thread";
 static const char *cfg_sb_async_buffer = "async_buffer_size";
 static const char *cfg_sb_matcher = "message_matcher";
@@ -67,6 +69,7 @@ static void init_sandbox_config(hs_sandbox_config *cfg)
   cfg->cfg_lua = NULL;
   cfg->message_matcher = NULL;
   cfg->ticker_interval = 0;
+  cfg->ticker_sync = 0;
   cfg->thread = 0;
   cfg->async_buffer_size = 0;
 }
@@ -76,6 +79,7 @@ static void init_config(hs_config *cfg)
 {
   cfg->run_path = NULL;
   cfg->load_path = NULL;
+  cfg->load_interval = 60;
   cfg->output_path = NULL;
   cfg->io_lua_path = NULL;
   cfg->io_lua_cpath = NULL;
@@ -210,6 +214,9 @@ static int load_sandbox_defaults(lua_State *L,
   if (get_numeric_item(L, 1, cfg_sb_ticker_interval, &cfg->ticker_interval)) {
     return 1;
   }
+  if (get_numeric_item(L, 1, cfg_sb_ticker_sync, &cfg->ticker_sync)) {
+    return 1;
+  }
   if (get_bool_item(L, 1, cfg_sb_preserve, &cfg->preserve_data)) return 1;
 
   if (check_for_unknown_options(L, 1, key)) return 1;
@@ -312,6 +319,7 @@ bool hs_load_sandbox_config(const char *dir,
     cfg->memory_limit = dflt->memory_limit;
     cfg->instruction_limit = dflt->instruction_limit;
     cfg->ticker_interval = dflt->ticker_interval;
+    cfg->ticker_sync = dflt->ticker_sync;
     cfg->preserve_data = dflt->preserve_data;
   }
 
@@ -353,6 +361,10 @@ bool hs_load_sandbox_config(const char *dir,
 
   ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_sb_ticker_interval,
                          &cfg->ticker_interval);
+  if (ret) goto cleanup;
+
+  ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_sb_ticker_sync,
+                         &cfg->ticker_sync);
   if (ret) goto cleanup;
 
   ret = get_string_item(L, LUA_GLOBALSINDEX, cfg_sb_filename, &cfg->filename,
@@ -441,6 +453,14 @@ int hs_load_config(const char *fn, hs_config *cfg)
 
   ret = get_string_item(L, LUA_GLOBALSINDEX, cfg_load_path, &cfg->load_path,
                         "");
+  if (ret) goto cleanup;
+
+  ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_load_interval,
+                         &cfg->load_interval);
+  if (cfg->load_interval < 1) {
+    lua_pushfstring(L, "%s must be >= 1", cfg_load_interval);
+    ret = 1;
+  }
   if (ret) goto cleanup;
 
   ret = get_string_item(L, LUA_GLOBALSINDEX, cfg_run_path, &cfg->run_path,
@@ -610,6 +630,7 @@ bool hs_get_full_config(lsb_output_buffer *ob, char type, const hs_config *cfg,
     lsb_outputf(ob, "output_size = %u\n", cfg->output_size);
     lsb_outputf(ob, "max_message_size = %u\n", cfg->max_message_size);
     lsb_outputf(ob, "sandbox_load_path = [[%s]]\n", cfg->load_path);
+    lsb_outputf(ob, "sandbox_load_interval = [[%d]]\n", cfg->load_interval);
     lsb_outputf(ob, "sandbox_run_path = [[%s]]\n", cfg->run_path);
   }
 

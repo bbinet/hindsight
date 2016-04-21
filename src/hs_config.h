@@ -39,6 +39,7 @@ typedef struct hs_sandbox_config
   unsigned memory_limit;
   unsigned instruction_limit;
   unsigned ticker_interval;
+  unsigned ticker_sync;
   bool preserve_data;
 } hs_sandbox_config;
 
@@ -56,6 +57,7 @@ typedef struct hs_config
   unsigned output_size;
   unsigned analysis_threads;
   unsigned backpressure;
+  unsigned load_interval;
   int pid;
   hs_checkpoint_reader cp_reader;
   hs_sandbox_config ipd; // input plugin defaults

@@ -106,9 +106,20 @@ create_analysis_plugin(lsb_message_match_builder *mmb, const hs_config *cfg,
 
   p->ticker_interval = sbc->ticker_interval;
   int stagger = p->ticker_interval > 60 ? 60 : p->ticker_interval;
+  time_t now = time(NULL);
   // distribute when the timer_events will fire
   if (stagger) {
-    p->ticker_expires = time(NULL) + rand() % stagger;
+    switch (sbc->ticker_sync) {
+    case 1: // sync ticker_interval on epoch number
+      p->ticker_expires = now + sbc->ticker_interval - now % sbc->ticker_interval;
+      break;
+    case 2: // don't sync ticker_interval: use current time
+      p->ticker_expires = now + sbc->ticker_interval;
+      break;
+    default: // random sync (the default)
+      p->ticker_expires = now + rand() % stagger;
+      break;
+    }
   }
 
   p->mm = lsb_create_message_matcher(mmb, sbc->message_matcher);
@@ -357,7 +368,7 @@ static void analyze_message(hs_analysis_thread *at)
 
     if (ret <= 0 && p->ticker_interval && at->current_t >= p->ticker_expires) {
       ret = lsb_heka_timer_event(p->hsb, at->current_t, false);
-      p->ticker_expires = at->current_t + p->ticker_interval;
+      p->ticker_expires = p->ticker_expires + p->ticker_interval;
     }
 
     if (ret > 0) terminate_sandbox(at, i);
