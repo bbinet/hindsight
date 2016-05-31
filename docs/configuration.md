@@ -34,22 +34,30 @@ in that thread of execution), so you don't really want a value lower than 60 sec
   are both on the same file (count, default 0 (no backpressure))
   e.g. backpressure = 10 [writer = 100.log, slowest reader = 89.log, delta = 11]
 * **hostname** - hostname used in logging/messages (default gethostname())
+* **remove_checkpoint_on_stop** - removes the checkpoint entry when the plugin
+  is stopped, terminated, or has been manually removed (default false)
 
 ```lua
-output_path             = "hs_output"
-output_size             = 1024 * 1024 * 1024
-sandbox_load_path       = "hs_load"
+output_path             = "output"
+output_size             = 64 * 1024
+sandbox_load_path       = "load"
 sandbox_load_interval   = 60
-sandbox_run_path        = "hs_run"
+sandbox_run_path        = "run"
 analysis_threads        = 1
 analysis_lua_path       = "/usr/lib/luasandbox/modules/?.lua"
 analysis_lua_cpath      = "/usr/lib/luasandbox/modules/?.so"
 io_lua_path             = analysis_lua_path ..  ";/usr/lib/luasandbox/io_modules/?.lua"
 io_lua_cpath            = analysis_lua_cpath .. ";/usr/lib/luasandbox/io_modules/?.so"
-max_message_size        = 1024 * 1024
+max_message_size        = 64 * 1024
+backpressure            = 2
 
 input_defaults = {
   -- see: Default Sandbox Configuration Variables
+  -- output_limit      = 64 * 1024
+  -- memory_limit      = 8 * 1024 * 1024
+  -- instruction_limit = 1e6
+  -- preserve_data     = false
+  -- ticker_interval   = 0
 }
 
 analysis_defaults = {

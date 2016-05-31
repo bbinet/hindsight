@@ -32,11 +32,25 @@ static const char g_module[] = "hindsight";
 static sem_t g_shutdown;
 
 
-static void stop_signal(int sig)
+void* sig_handler(void *arg)
 {
-  fprintf(stderr, "stop signal received %d\n", sig);
-  signal(SIGINT, SIG_DFL);
-  sem_post(&g_shutdown);
+  (void)arg;
+  int sig;
+  sigset_t signal_set;
+  sigemptyset(&signal_set);
+  sigaddset(&signal_set, SIGINT);
+
+  for (;;) {
+    sigwait(&signal_set, &sig);
+    if (sig == SIGINT) {
+      hs_log(NULL, g_module, 6, "stop signal received");
+      sem_post(&g_shutdown);
+      break;
+    } else {
+      hs_log(NULL, g_module, 6, "unexpected signal received %d", sig);
+    }
+  }
+  return (void *)0;
 }
 
 
@@ -71,23 +85,35 @@ int main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
-  hs_log(g_module, 6, "starting");
-  signal(SIGINT, stop_signal);
+  if (cfg.rm_checkpoint) {
+    hs_cleanup_checkpoints(&cfg.cp_reader, cfg.run_path,
+                           cfg.analysis_threads);
+  }
 
-  lsb_message_match_builder *mmb;
-  mmb = lsb_create_message_match_builder(cfg.analysis_lua_path,
-                                         cfg.analysis_lua_cpath);
+  hs_log(NULL, g_module, 6, "starting");
+  sigset_t signal_set;
+  sigfillset(&signal_set);
+  if (pthread_sigmask(SIG_SETMASK, &signal_set, NULL)) {
+    perror("pthread_sigmask failed");
+    exit(EXIT_FAILURE);
+  }
+  pthread_t sig_thread;
+  if (pthread_create(&sig_thread, NULL, sig_handler, NULL)) {
+    hs_log(NULL, g_module, 1, "signal handler could not be setup");
+    return EXIT_FAILURE;
+  }
+
   hs_input_plugins ips;
   hs_init_input_plugins(&ips, &cfg);
   hs_load_input_plugins(&ips, &cfg, false);
 
   hs_analysis_plugins aps;
-  hs_init_analysis_plugins(&aps, &cfg, mmb);
+  hs_init_analysis_plugins(&aps, &cfg);
   hs_load_analysis_plugins(&aps, &cfg, false);
   hs_start_analysis_threads(&aps);
 
   hs_output_plugins ops;
-  hs_init_output_plugins(&ops, &cfg, mmb);
+  hs_init_output_plugins(&ops, &cfg);
   hs_load_output_plugins(&ops, &cfg, false);
 
   hs_checkpoint_writer cpw;
@@ -97,7 +123,7 @@ int main(int argc, char *argv[])
   unsigned cnt = 0;
   while (true) {
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-      hs_log(g_module, 3, "clock_gettime failed");
+      hs_log(NULL, g_module, 3, "clock_gettime failed");
       ts.tv_sec = time(NULL);
       ts.tv_nsec = 0;
     }
@@ -108,7 +134,8 @@ int main(int argc, char *argv[])
     }
     hs_write_checkpoints(&cpw, &cfg.cp_reader);
     if (cfg.load_path[0] != 0 && ++cnt == cfg.load_interval) {
-      hs_log(g_module, 7, "scan load directories");
+      // scan just before emitting the stats
+      hs_log(NULL, g_module, 7, "scan load directories");
       hs_load_input_plugins(&ips, &cfg, true);
       hs_load_analysis_plugins(&aps, &cfg, true);
       hs_load_output_plugins(&ops, &cfg, true);
@@ -116,9 +143,9 @@ int main(int argc, char *argv[])
     }
 #ifdef HINDSIGHT_CLI
     if (ips.list_cnt == 0) {
-      hs_log(g_module, 6, "input plugins have exited; "
+      hs_log(NULL, g_module, 6, "input plugins have exited; "
              "cascading shutdown initiated");
-      break; // when all the inputs are done, exit
+      pthread_kill(sig_thread, SIGINT); // when all the inputs are done, exit
     }
 #endif
   }
@@ -155,12 +182,12 @@ int main(int argc, char *argv[])
   hs_free_output_plugins(&ops);
 #endif
 
-  lsb_destroy_message_match_builder(mmb);
   hs_free_checkpoint_writer(&cpw);
   hs_free_config(&cfg);
   hs_free_log();
 
-  hs_log(g_module, 6, "exiting");
+  pthread_join(sig_thread, NULL);
+  hs_log(NULL, g_module, 6, "exiting");
   sem_destroy(&g_shutdown);
   return 0;
 }
