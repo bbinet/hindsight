@@ -61,7 +61,6 @@ static void free_ip_checkpoint(hs_ip_checkpoint *cp)
 static bool update_checkpoint(double d, const char *s, hs_ip_checkpoint *cp)
 {
   if (!isnan(d)) {
-    pthread_mutex_lock(&cp->lock);
     if (cp->type == HS_CP_STRING) {
       free(cp->value.s);
       cp->value.s = NULL;
@@ -70,9 +69,7 @@ static bool update_checkpoint(double d, const char *s, hs_ip_checkpoint *cp)
     }
     cp->type = HS_CP_NUMERIC;
     cp->value.d = d;
-    pthread_mutex_unlock(&cp->lock);
   } else if (s) {
-    pthread_mutex_lock(&cp->lock);
     if (cp->type == HS_CP_NUMERIC) cp->value.s = NULL;
     cp->type = HS_CP_STRING;
     cp->len = strlen(s);
@@ -84,7 +81,6 @@ static bool update_checkpoint(double d, const char *s, hs_ip_checkpoint *cp)
         if (!cp->value.s) {
           cp->len = 0;
           cp->cap = 0;
-          pthread_mutex_unlock(&cp->lock);
           hs_log(NULL, g_module, 0, "malloc failed");
           return false;
         }
@@ -92,12 +88,10 @@ static bool update_checkpoint(double d, const char *s, hs_ip_checkpoint *cp)
       }
       memcpy(cp->value.s, s, cp->len);
     } else {
-      pthread_mutex_unlock(&cp->lock);
       hs_log(NULL, g_module, 3, "checkpoint string exceeds %d",
              HS_MAX_IP_CHECKPOINT);
       return false;
     }
-    pthread_mutex_unlock(&cp->lock);
   }
   return true;
 }
@@ -114,8 +108,25 @@ static int inject_message(void *parent,
   static char header[14];
 
   hs_input_plugin *p = parent;
-  if (!update_checkpoint(cp_numeric, cp_string, &p->cp)) return false;
+  int rv;
+  pthread_mutex_lock(&p->cp.lock);
+  rv = !update_checkpoint(cp_numeric, cp_string, &p->cp);
+  if (p->sample) {
+    p->stats = lsb_heka_get_stats(p->hsb);
+    p->sample = false;
+  }
+  pthread_mutex_unlock(&p->cp.lock);
 
+  if (!pb) { // a NULL message is used as a synchronization point
+    if (!sem_trywait(&p->shutdown)) {
+      sem_post(&p->shutdown);
+      lsb_heka_stop_sandbox_clean(p->hsb);
+    }
+    return rv;
+  }
+  if (rv) return rv;
+
+  bool bp;
   pthread_mutex_lock(&p->plugins->output.lock);
   int len = lsb_pb_output_varint(header + 3, pb_len);
   int tlen = 4 + len + pb_len;
@@ -124,35 +135,59 @@ static int inject_message(void *parent,
   header[1] = (char)(len + 1);
   header[2] = 0x08;
   header[3 + len] = 0x1f;
-  fwrite(header, 4 + len, 1, p->plugins->output.fh);
-  fwrite(pb, pb_len, 1, p->plugins->output.fh);
-  bytes_written += tlen;
-  if (bytes_written > BUFSIZ) {
-    p->plugins->output.cp.offset += bytes_written;
-    bytes_written = 0;
-    if (p->plugins->output.cp.offset >= p->plugins->cfg->output_size) {
-      ++p->plugins->output.cp.id;
-      hs_open_output_file(&p->plugins->output);
-      if (p->plugins->cfg->backpressure
-          && p->plugins->output.cp.id - p->plugins->output.min_cp_id
-          > p->plugins->cfg->backpressure) {
-        backpressure = true;
-        hs_log(NULL, g_module, 4, "applying backpressure");
+  if (fwrite(header, 4 + len, 1, p->plugins->output.fh) == 1
+      && fwrite(pb, pb_len, 1, p->plugins->output.fh) == 1) {
+    bytes_written += tlen;
+    if (bytes_written > BUFSIZ) {
+      p->plugins->output.cp.offset += bytes_written;
+      bytes_written = 0;
+      if (p->plugins->output.cp.offset >= p->plugins->cfg->output_size) {
+        ++p->plugins->output.cp.id;
+        hs_open_output_file(&p->plugins->output);
+        if (p->plugins->cfg->backpressure
+            && p->plugins->output.cp.id - p->plugins->output.min_cp_id
+            > p->plugins->cfg->backpressure) {
+          backpressure = true;
+          hs_log(NULL, g_module, 4, "applying backpressure (checkpoint)");
+        }
+        if (!backpressure && p->plugins->cfg->backpressure_df) {
+          unsigned df = hs_disk_free_ob(p->plugins->output.path,
+                                        p->plugins->cfg->output_size);
+          if (df <= p->plugins->cfg->backpressure_df) {
+            backpressure = true;
+            hs_log(NULL, g_module, 4, "applying backpressure (disk)");
+          }
+        }
       }
     }
-  }
-  if (backpressure) {
-    if (p->plugins->output.cp.id == p->plugins->output.min_cp_id) {
-      backpressure = false;
-      hs_log(NULL, g_module, 4, "releasing backpressure");
+    if (backpressure) {
+      bool release_dfbp = true;
+      if (p->plugins->cfg->backpressure_df) {
+        unsigned df = hs_disk_free_ob(p->plugins->output.path,
+                                      p->plugins->cfg->output_size);
+        release_dfbp = (df > p->plugins->cfg->backpressure_df);
+      }
+      // even if we triggered on disk space continue to backpressure
+      // until the queue is caught up too
+      if (p->plugins->output.cp.id == p->plugins->output.min_cp_id
+          && release_dfbp) {
+        backpressure = false;
+        hs_log(NULL, g_module, 4, "releasing backpressure");
+      }
     }
+    rv = 0;
+  } else {
+    hs_log(NULL, g_module, 0, "inject_message fwrite failed: %s",
+           strerror(ferror(p->plugins->output.fh)));
+    exit(EXIT_FAILURE);
   }
+  bp = backpressure;
   pthread_mutex_unlock(&p->plugins->output.lock);
 
-  if (backpressure) {
+  if (bp) {
     usleep(100000); // throttle to 10 messages per second
   }
-  return 0;
+  return rv;
 }
 
 
@@ -176,7 +211,7 @@ create_input_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
 {
   char *state_file = NULL;
   char lua_file[HS_MAX_PATH];
-  if (!hs_get_fqfn(sbc->dir, sbc->filename, lua_file, sizeof(lua_file))) {
+  if (hs_get_fqfn(sbc->dir, sbc->filename, lua_file, sizeof(lua_file))) {
     hs_log(NULL, g_module, 3, "%s failed to construct the lua_file path",
            sbc->cfg_name);
     return NULL;
@@ -263,6 +298,7 @@ create_input_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
   return p;
 }
 
+
 static void* input_thread(void *arg)
 {
   hs_input_plugin *p = (hs_input_plugin *)arg;
@@ -291,23 +327,25 @@ static void* input_thread(void *arg)
     }
     ret = lsb_heka_pm_input(p->hsb, ncp, scp, profile);
     if (ret <= 0) {
-      if (p->ticker_interval == 0) break; // run once
-
-      if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-        hs_log(NULL, p->name, 3, "clock_gettime failed");
-        ts.tv_sec = time(NULL);
-        ts.tv_nsec = 0;
+      if (p->ticker_interval == 0) { // run once
+        if (!sem_trywait(&p->shutdown)) {
+          shutdown = true;
+        }
+        break; // exit
+      } else {  // poll
+        if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+          hs_log(NULL, p->name, 3, "clock_gettime failed");
+          ts.tv_sec = time(NULL);
+          ts.tv_nsec = 0;
+        }
+        ts.tv_sec += p->ticker_interval;
+        if (!sem_timedwait(&p->shutdown, &ts)) {
+          shutdown = true;
+          break; // shutting down
+        }
       }
-      ts.tv_sec += p->ticker_interval;
-      if (!sem_timedwait(&p->shutdown, &ts)) {
-        sem_post(&p->shutdown);
-        shutdown = true;
-        break; // shutting down
-      }
-      // poll
     } else {
       if (!sem_trywait(&p->shutdown)) {
-        sem_post(&p->shutdown);
         shutdown = true;
       }
       break; // exiting due to error
@@ -325,6 +363,7 @@ static void* input_thread(void *arg)
 
   if (shutdown) {
     hs_log(NULL, p->name, 6, "shutting down");
+    sem_post(&p->shutdown);
   } else {
     hs_log(NULL, p->name, 6, "detaching received: %d msg: %s", ret,
            lsb_heka_get_error(p->hsb));
@@ -352,12 +391,28 @@ static bool join_thread(hs_input_plugins *plugins, hs_input_plugin *p)
     ts.tv_sec = time(NULL);
     ts.tv_nsec = 0;
   }
-  ts.tv_sec += 2;
 
+  ts.tv_sec += 2;
   if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
-    p->orphaned = true;
-    hs_log(NULL, p->name, 4, "plugin is blocked on a system call");
-    return false;
+    lsb_heka_stop_sandbox(p->hsb);
+    hs_log(NULL, p->name, 4, "sandbox did not respond to a clean stop");
+    ts.tv_sec += 2;
+    if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
+      if (!sem_trywait(&p->shutdown)) {
+        p->orphaned = true;
+        hs_log(NULL, p->name, 3, "sandbox did not respond to a forced stop "
+                                 "(orphaning)");
+        sem_post(&p->shutdown);
+        return false;
+      } else {
+        ts.tv_sec += 1;
+        if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
+          hs_log(NULL, p->name, 2, "sandbox acknowledged the stop but failed "
+                                   "to stop (undefined behavior)");
+          return false;
+        }
+      }
+    }
   }
   destroy_input_plugin(p);
   --plugins->list_cnt;
@@ -369,7 +424,7 @@ static bool remove_plugin(hs_input_plugins *plugins, int idx)
 {
   hs_input_plugin *p = plugins->list[idx];
   sem_post(&p->shutdown);
-  lsb_heka_stop_sandbox(p->hsb);
+  lsb_heka_stop_sandbox_clean(p->hsb);
   if (join_thread(plugins, p)) {
     plugins->list[idx] = NULL;
     return true;
@@ -522,11 +577,11 @@ static void process_lua(hs_input_plugins *plugins, const char *lpath,
   while ((entry = readdir(dp))) {
     if (hs_has_ext(entry->d_name, hs_lua_ext)) {
       // move the Lua to the run directory
-      if (!hs_get_fqfn(lpath, entry->d_name, lua_lpath, sizeof(lua_lpath))) {
+      if (hs_get_fqfn(lpath, entry->d_name, lua_lpath, sizeof(lua_lpath))) {
         hs_log(NULL, g_module, 0, "load lua path too long");
         exit(EXIT_FAILURE);
       }
-      if (!hs_get_fqfn(rpath, entry->d_name, lua_rpath, sizeof(lua_rpath))) {
+      if (hs_get_fqfn(rpath, entry->d_name, lua_rpath, sizeof(lua_rpath))) {
         hs_log(NULL, g_module, 0, "run lua path too long");
         exit(EXIT_FAILURE);
       }
@@ -579,11 +634,11 @@ void hs_load_input_plugins(hs_input_plugins *plugins, const hs_config *cfg,
 {
   char lpath[HS_MAX_PATH];
   char rpath[HS_MAX_PATH];
-  if (!hs_get_fqfn(cfg->load_path, hs_input_dir, lpath, sizeof(lpath))) {
+  if (hs_get_fqfn(cfg->load_path, hs_input_dir, lpath, sizeof(lpath))) {
     hs_log(NULL, g_module, 0, "load path too long");
     exit(EXIT_FAILURE);
   }
-  if (!hs_get_fqfn(cfg->run_path, hs_input_dir, rpath, sizeof(rpath))) {
+  if (hs_get_fqfn(cfg->run_path, hs_input_dir, rpath, sizeof(rpath))) {
     hs_log(NULL, g_module, 0, "run path too long");
     exit(EXIT_FAILURE);
   }
@@ -641,9 +696,7 @@ void hs_stop_input_plugins(hs_input_plugins *plugins)
   pthread_mutex_lock(&plugins->list_lock);
   for (int i = 0; i < plugins->list_cap; ++i) {
     if (!plugins->list[i]) continue;
-
     sem_post(&plugins->list[i]->shutdown);
-    lsb_heka_stop_sandbox(plugins->list[i]->hsb);
   }
   pthread_mutex_unlock(&plugins->list_lock);
 }

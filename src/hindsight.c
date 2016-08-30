@@ -39,10 +39,11 @@ void* sig_handler(void *arg)
   sigset_t signal_set;
   sigemptyset(&signal_set);
   sigaddset(&signal_set, SIGINT);
+  sigaddset(&signal_set, SIGTERM);
 
   for (;;) {
     sigwait(&signal_set, &sig);
-    if (sig == SIGINT) {
+    if (sig == SIGINT || sig == SIGTERM) {
       hs_log(NULL, g_module, 6, "stop signal received");
       sem_post(&g_shutdown);
       break;
@@ -156,7 +157,7 @@ int main(int argc, char *argv[])
   hs_write_checkpoints(&cpw, &cfg.cp_reader);
   hs_free_input_plugins(&ips);
 
-  aps.stop = true;
+  hs_stop_analysis_plugins(&aps);
   hs_wait_analysis_plugins(&aps);
   hs_write_checkpoints(&cpw, &cfg.cp_reader);
   hs_free_analysis_plugins(&aps);
@@ -168,7 +169,7 @@ int main(int argc, char *argv[])
 #else
   // non CLI mode should shut everything down immediately
   hs_stop_input_plugins(&ips);
-  aps.stop = true;
+  hs_stop_analysis_plugins(&aps);
   hs_stop_output_plugins(&ops);
 
   hs_wait_input_plugins(&ips);
@@ -184,10 +185,10 @@ int main(int argc, char *argv[])
 
   hs_free_checkpoint_writer(&cpw);
   hs_free_config(&cfg);
-  hs_free_log();
 
   pthread_join(sig_thread, NULL);
   hs_log(NULL, g_module, 6, "exiting");
+  hs_free_log();
   sem_destroy(&g_shutdown);
   return 0;
 }

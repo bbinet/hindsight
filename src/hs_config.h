@@ -41,6 +41,7 @@ typedef struct hs_sandbox_config
   unsigned ticker_interval;
   unsigned ticker_sync;
   bool preserve_data;
+  bool restricted_headers;
 } hs_sandbox_config;
 
 typedef struct hs_config
@@ -58,6 +59,7 @@ typedef struct hs_config
   unsigned analysis_threads;
   unsigned backpressure;
   unsigned load_interval;
+  unsigned backpressure_df;
   bool rm_checkpoint;
   int pid;
   hs_checkpoint_reader cp_reader;

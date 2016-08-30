@@ -31,15 +31,23 @@ in that thread of execution), so you don't really want a value lower than 60 sec
 * **max_message_size** - maximum size of a valid message (bytes, default 64KiB)
 * **backpressure** - delta between the writer queue file and the slowest reader, when exceeded
   backpressure is applied  (message injection will be slowed) until the writer and reader
-  are both on the same file (count, default 0 (no backpressure))
-  e.g. backpressure = 10 [writer = 100.log, slowest reader = 89.log, delta = 11]
+  are both on the same file (count, default 0 (no backpressure)) e.g.
+```lua
+backpressure = 10 -- [writer = 100.log, slowest reader = 89.log, delta = 11]
+```
+* **backpressure_disk_free** - Number of output file units (`N * <output_size>`). Backpressure is applied
+  (message injection will be slowed) until the free space rises above this threshold
+  (count, default 4 (0 to disable)) e.g.
+```lua
+backpressure_disk_free = 4 -- [256MiB when using the defaults]
+```
 * **hostname** - hostname used in logging/messages (default gethostname())
 * **remove_checkpoint_on_stop** - removes the checkpoint entry when the plugin
   is stopped, terminated, or has been manually removed (default false)
 
 ```lua
 output_path             = "output"
-output_size             = 64 * 1024
+output_size             = 64 * 1024 * 1024
 sandbox_load_path       = "load"
 sandbox_load_interval   = 60
 sandbox_run_path        = "run"
@@ -53,11 +61,12 @@ backpressure            = 2
 
 input_defaults = {
   -- see: Default Sandbox Configuration Variables
-  -- output_limit      = 64 * 1024
-  -- memory_limit      = 8 * 1024 * 1024
-  -- instruction_limit = 1e6
-  -- preserve_data     = false
-  -- ticker_interval   = 0
+  -- output_limit       = 64 * 1024
+  -- memory_limit       = 8 * 1024 * 1024
+  -- instruction_limit  = 1e6
+  -- preserve_data      = false
+  -- restricted_headers = false
+  -- ticker_interval    = 0
 }
 
 analysis_defaults = {
@@ -78,6 +87,8 @@ output_defaults = {
 * **instruction_limit** - the maximum number of Lua instructions a plugin can execute in a single `process_message` or
 `timer_event` function call (count, default 1MM)
 * **preserve_data** - flag indicating if all global data should be saved on shutdown (bool, default false)
+* **restricted_headers** - flag indicating that the following header fields are not user modifiable
+  `Hostname` and `Logger` (bool, default true (analysis), false (input/output))
 * **ticker_interval** (default 0)
   * For input plugins it is the poll interval when `process_message` is called see: [polling input
 plugins](https://github.com/mozilla-services/lua_sandbox/blob/master/docs/heka/input.md#polling)

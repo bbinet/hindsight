@@ -33,8 +33,10 @@ static int inject_message(void *parent, const char *pb, size_t pb_len)
 {
   static bool backpressure = false;
   static char header[14];
-  hs_analysis_plugin *p = parent;
 
+  hs_analysis_plugin *p = parent;
+  int rv = 1;
+  bool bp;
   pthread_mutex_lock(&p->at->plugins->output.lock);
   int len = lsb_pb_output_varint(header + 3, pb_len);
   int tlen = 4 + len + pb_len;
@@ -42,31 +44,55 @@ static int inject_message(void *parent, const char *pb, size_t pb_len)
   header[1] = (char)(len + 1);
   header[2] = 0x08;
   header[3 + len] = 0x1f;
-  fwrite(header, 4 + len, 1, p->at->plugins->output.fh);
-  fwrite(pb, pb_len, 1, p->at->plugins->output.fh);
-  p->at->plugins->output.cp.offset += tlen;
-  if (p->at->plugins->output.cp.offset >= p->at->plugins->cfg->output_size) {
-    ++p->at->plugins->output.cp.id;
-    hs_open_output_file(&p->at->plugins->output);
-    if (p->at->plugins->cfg->backpressure
-        && p->at->plugins->output.cp.id - p->at->plugins->output.min_cp_id
-        > p->at->plugins->cfg->backpressure) {
-      backpressure = true;
-      hs_log(NULL, g_module, 4, "applying backpressure");
+  if (fwrite(header, 4 + len, 1, p->at->plugins->output.fh) == 1
+      && fwrite(pb, pb_len, 1, p->at->plugins->output.fh) == 1) {
+    p->at->plugins->output.cp.offset += tlen;
+    if (p->at->plugins->output.cp.offset >= p->at->plugins->cfg->output_size) {
+      ++p->at->plugins->output.cp.id;
+      hs_open_output_file(&p->at->plugins->output);
+      if (p->at->plugins->cfg->backpressure
+          && p->at->plugins->output.cp.id - p->at->plugins->output.min_cp_id
+          > p->at->plugins->cfg->backpressure) {
+        backpressure = true;
+        hs_log(NULL, g_module, 4, "applying backpressure (checkpoint)");
+      }
+      if (!backpressure && p->at->plugins->cfg->backpressure_df) {
+        unsigned df = hs_disk_free_ob(p->at->plugins->output.path,
+                                      p->at->plugins->cfg->output_size);
+        if (df <= p->at->plugins->cfg->backpressure_df) {
+          backpressure = true;
+          hs_log(NULL, g_module, 4, "applying backpressure (disk)");
+        }
+      }
     }
-  }
-  if (backpressure) {
-    if (p->at->plugins->output.cp.id == p->at->plugins->output.min_cp_id) {
-      backpressure = false;
-      hs_log(NULL, g_module, 4, "releasing backpressure");
+    if (backpressure) {
+      bool release_dfbp = true;
+      if (p->at->plugins->cfg->backpressure_df) {
+        unsigned df = hs_disk_free_ob(p->at->plugins->output.path,
+                                      p->at->plugins->cfg->output_size);
+        release_dfbp = (df > p->at->plugins->cfg->backpressure_df);
+      }
+      // even if we triggered on disk space continue to backpressure
+      // until the queue is caught up too
+      if (p->at->plugins->output.cp.id == p->at->plugins->output.min_cp_id
+          && release_dfbp) {
+        backpressure = false;
+        hs_log(NULL, g_module, 4, "releasing backpressure");
+      }
     }
+    rv = 0;
+  } else {
+    hs_log(NULL, g_module, 0, "inject_message fwrite failed: %s",
+           strerror(ferror(p->at->plugins->output.fh)));
+    exit(EXIT_FAILURE);
   }
+  bp = backpressure;
   pthread_mutex_unlock(&p->at->plugins->output.lock);
 
-  if (backpressure) {
+  if (bp) {
     usleep(100000); // throttle to 10 messages per second
   }
-  return 0;
+  return rv;
 }
 
 
@@ -90,7 +116,7 @@ create_analysis_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
   char *state_file = NULL;
 
   char lua_file[HS_MAX_PATH];
-  if (!hs_get_fqfn(sbc->dir, sbc->filename, lua_file, sizeof(lua_file))) {
+  if (hs_get_fqfn(sbc->dir, sbc->filename, lua_file, sizeof(lua_file))) {
     hs_log(NULL, g_module, 3, "%s failed to construct the lua_file path",
            sbc->cfg_name);
     return NULL;
@@ -171,7 +197,7 @@ create_analysis_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
     destroy_analysis_plugin(p);
     return NULL;
   }
-  lsb_logger logger = {.context = NULL, .cb = hs_log};
+  lsb_logger logger = { .context = NULL, .cb = hs_log };
   p->hsb = lsb_heka_create_analysis(p, lua_file, state_file, ob.buf, &logger,
                                     inject_message);
   lsb_free_output_buffer(&ob);
@@ -290,6 +316,8 @@ static void init_analysis_thread(hs_analysis_plugins *plugins, int tid)
   at->list_cap = 0;
   at->list_cnt = 0;
   at->tid = tid;
+  at->stop = false;
+  at->sample = false;
 
   char name[255];
   int n = snprintf(name, sizeof name, "%s%d", hs_analysis_dir, tid);
@@ -335,10 +363,9 @@ static void terminate_sandbox(hs_analysis_thread *at, int i)
 }
 
 
-static void analyze_message(hs_analysis_thread *at)
+static void analyze_message(hs_analysis_thread *at, bool sample)
 {
   hs_analysis_plugin *p = NULL;
-  bool sample = at->plugins->sample;
   int ret;
 
   pthread_mutex_lock(&at->list_lock);
@@ -364,6 +391,9 @@ static void analyze_message(hs_analysis_thread *at)
           }
         }
       }
+    }
+    if (sample) {
+      p->stats = lsb_heka_get_stats(p->hsb);
     }
 
     if (ret <= 0 && p->ticker_interval && at->current_t >= p->ticker_expires) {
@@ -399,37 +429,35 @@ static void* input_thread(void *arg)
   lsb_heka_message msg;
   lsb_init_heka_message(&msg, 8);
 
-  hs_config *cfg = at->plugins->cfg;
-  hs_lookup_input_checkpoint(&cfg->cp_reader,
-                             hs_input_dir,
-                             at->input.name,
-                             cfg->output_path,
-                             &at->input.cp);
-  at->cp.id = at->input.cp.id;
-  at->cp.offset = at->input.cp.offset;
   size_t discarded_bytes;
-
   size_t bytes_read = 0;
-  lsb_logger logger = {.context = NULL, .cb = hs_log};
+  lsb_logger logger = { .context = NULL, .cb = hs_log };
+  bool stop = false;
+  bool sample = false;
 #ifdef HINDSIGHT_CLI
   bool input_stop = false;
-  while (!(at->plugins->stop && input_stop)) {
+  while (!(stop && input_stop)) {
 #else
-  while (!at->plugins->stop) {
+  while (!stop) {
 #endif
+    pthread_mutex_lock(&at->cp_lock);
+    stop = at->stop;
+    sample = at->sample;
+    pthread_mutex_unlock(&at->cp_lock);
+
     if (at->input.fh) {
       if (lsb_find_heka_message(&msg, &at->input.ib, true, &discarded_bytes,
                                 &logger)) {
         at->msg = &msg;
         at->current_t = time(NULL);
-        analyze_message(at);
+        analyze_message(at, sample);
 
         // advance the checkpoint
         pthread_mutex_lock(&at->cp_lock);
-        at->plugins->sample = false;
         at->cp.id = at->input.cp.id;
         at->cp.offset = at->input.cp.offset -
             (at->input.ib.readpos - at->input.ib.scanpos);
+        if (sample) at->sample = false;
         pthread_mutex_unlock(&at->cp_lock);
       } else {
         bytes_read = hs_read_file(&at->input);
@@ -442,7 +470,7 @@ static void* input_thread(void *arg)
         // see if the next file is there yet
         hs_open_file(&at->input, hs_input_dir, at->input.cp.id + 1);
 #ifdef HINDSIGHT_CLI
-        if (cid == at->input.cp.id && at->plugins->stop) {
+        if (cid == at->input.cp.id && stop) {
           input_stop = true;
         }
 #endif
@@ -450,7 +478,7 @@ static void* input_thread(void *arg)
     } else { // still waiting on the first file
       hs_open_file(&at->input, hs_input_dir, at->input.cp.id);
 #ifdef HINDSIGHT_CLI
-      if (!at->input.fh && at->plugins->stop) {
+      if (!at->input.fh && stop) {
         input_stop = true;
       }
 #endif
@@ -463,7 +491,7 @@ static void* input_thread(void *arg)
       lsb_clear_heka_message(&msg); // create an idle/empty message
       at->msg = &msg;
       at->current_t = time(NULL);
-      analyze_message(at);
+      analyze_message(at, false);
       at->msg = NULL;
       sleep(1);
     }
@@ -481,14 +509,23 @@ void hs_init_analysis_plugins(hs_analysis_plugins *plugins, hs_config *cfg)
 
   plugins->thread_cnt = cfg->analysis_threads;
   plugins->cfg = cfg;
-  plugins->stop = false;
-  plugins->sample = false;
 
   plugins->list = malloc(sizeof(hs_analysis_thread) * cfg->analysis_threads);
   for (unsigned i = 0; i < cfg->analysis_threads; ++i) {
     init_analysis_thread(plugins, i);
   }
   plugins->threads = malloc(sizeof(pthread_t *) * (cfg->analysis_threads));
+}
+
+
+void hs_stop_analysis_plugins(hs_analysis_plugins *plugins)
+{
+  for (int i = 0; i < plugins->thread_cnt; ++i) {
+    hs_analysis_thread *at = &plugins->list[i];
+    pthread_mutex_lock(&at->cp_lock);
+    at->stop = true;
+    pthread_mutex_unlock(&at->cp_lock);
+  }
 }
 
 
@@ -517,7 +554,6 @@ void hs_free_analysis_plugins(hs_analysis_plugins *plugins)
 
   plugins->cfg = NULL;
   plugins->thread_cnt = 0;
-  plugins->sample = false;
 }
 
 
@@ -534,11 +570,11 @@ static void process_lua(hs_analysis_plugins *plugins, const char *lpath,
   while ((entry = readdir(dp))) {
     if (hs_has_ext(entry->d_name, hs_lua_ext)) {
       // move the Lua to the run directory
-      if (!hs_get_fqfn(lpath, entry->d_name, lua_lpath, sizeof(lua_lpath))) {
+      if (hs_get_fqfn(lpath, entry->d_name, lua_lpath, sizeof(lua_lpath))) {
         hs_log(NULL, g_module, 0, "load lua path too long");
         exit(EXIT_FAILURE);
       }
-      if (!hs_get_fqfn(rpath, entry->d_name, lua_rpath, sizeof(lua_rpath))) {
+      if (hs_get_fqfn(rpath, entry->d_name, lua_rpath, sizeof(lua_rpath))) {
         hs_log(NULL, g_module, 0, "run lua path too long");
         exit(EXIT_FAILURE);
       }
@@ -608,7 +644,7 @@ static int get_thread_id(const char *lpath, const char *rpath, const char *name)
 
     if (otid != ntid) { // mis-matched cfgs so remove the load .cfg
       char path[HS_MAX_PATH];
-      if (!hs_get_fqfn(lpath, name, path, sizeof(path))) {
+      if (hs_get_fqfn(lpath, name, path, sizeof(path))) {
         hs_log(NULL, g_module, 0, "load off path too long");
         exit(EXIT_FAILURE);
       }
@@ -632,7 +668,7 @@ static int get_thread_id(const char *lpath, const char *rpath, const char *name)
 
     // no config was found so remove the .off flag
     char path[HS_MAX_PATH];
-    if (!hs_get_fqfn(lpath, name, path, sizeof(path))) {
+    if (hs_get_fqfn(lpath, name, path, sizeof(path))) {
       hs_log(NULL, g_module, 0, "load off path too long");
       exit(EXIT_FAILURE);
     }
@@ -650,11 +686,11 @@ void hs_load_analysis_plugins(hs_analysis_plugins *plugins,
 {
   char lpath[HS_MAX_PATH];
   char rpath[HS_MAX_PATH];
-  if (!hs_get_fqfn(cfg->load_path, hs_analysis_dir, lpath, sizeof(lpath))) {
+  if (hs_get_fqfn(cfg->load_path, hs_analysis_dir, lpath, sizeof(lpath))) {
     hs_log(NULL, g_module, 0, "load path too long");
     exit(EXIT_FAILURE);
   }
-  if (!hs_get_fqfn(cfg->run_path, hs_analysis_dir, rpath, sizeof(rpath))) {
+  if (hs_get_fqfn(cfg->run_path, hs_analysis_dir, rpath, sizeof(rpath))) {
     hs_log(NULL, g_module, 0, "run path too long");
     exit(EXIT_FAILURE);
   }
@@ -712,8 +748,17 @@ void hs_load_analysis_plugins(hs_analysis_plugins *plugins,
 void hs_start_analysis_threads(hs_analysis_plugins *plugins)
 {
   for (int i = 0; i < plugins->thread_cnt; ++i) {
+    hs_analysis_thread *at = &plugins->list[i];
+    hs_config *cfg = at->plugins->cfg;
+    hs_lookup_input_checkpoint(&cfg->cp_reader,
+                               hs_input_dir,
+                               at->input.name,
+                               cfg->output_path,
+                               &at->input.cp);
+    at->cp.id = at->input.cp.id;
+    at->cp.offset = at->input.cp.offset;
     if (pthread_create(&plugins->threads[i], NULL, input_thread,
-                       (void *)&plugins->list[i])) {
+                       (void *)at)) {
       perror("hs_start_analysis_threads pthread_create failed");
       exit(EXIT_FAILURE);
     }

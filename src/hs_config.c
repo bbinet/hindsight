@@ -42,6 +42,7 @@ static const char *cfg_max_message_size = "max_message_size";
 static const char *cfg_hostname = "hostname";
 static const char *cfg_backpressure = "backpressure";
 static const char *cfg_load_interval = "sandbox_load_interval";
+static const char *cfg_backpressure_df = "backpressure_disk_free";
 static const char *cfg_rm_checkpoint = "remove_checkpoint_on_stop";
 
 static const char *cfg_sb_ipd = "input_defaults";
@@ -51,6 +52,7 @@ static const char *cfg_sb_output = "output_limit";
 static const char *cfg_sb_memory = "memory_limit";
 static const char *cfg_sb_instruction = "instruction_limit";
 static const char *cfg_sb_preserve = "preserve_data";
+static const char *cfg_sb_restricted_headers = "restricted_headers";
 static const char *cfg_sb_filename = "filename";
 static const char *cfg_sb_ticker_interval = "ticker_interval";
 static const char *cfg_sb_ticker_sync = "ticker_sync";
@@ -64,6 +66,7 @@ static void init_sandbox_config(hs_sandbox_config *cfg)
   cfg->memory_limit = 1024 * 1024 * 8;
   cfg->instruction_limit = 1000000;
   cfg->preserve_data = false;
+  cfg->restricted_headers = true;
   cfg->dir = NULL;
   cfg->filename = NULL;
   cfg->cfg_name = NULL;
@@ -91,11 +94,15 @@ static void init_config(hs_config *cfg)
   cfg->analysis_threads = 1;
   cfg->max_message_size = 1024 * 64;
   cfg->backpressure = 0;
+  cfg->backpressure_df = 4;
   cfg->rm_checkpoint = false;
   cfg->pid = (int)getpid();
   init_sandbox_config(&cfg->ipd);
   init_sandbox_config(&cfg->apd);
   init_sandbox_config(&cfg->opd);
+
+  cfg->ipd.restricted_headers = false;
+  cfg->opd.restricted_headers = false;
 }
 
 
@@ -221,6 +228,11 @@ static int load_sandbox_defaults(lua_State *L,
   }
   if (get_bool_item(L, 1, cfg_sb_preserve, &cfg->preserve_data)) return 1;
 
+  if (get_bool_item(L, 1, cfg_sb_restricted_headers,
+                    &cfg->restricted_headers)) {
+    return 1;
+  }
+
   if (check_for_unknown_options(L, 1, key)) return 1;
 
   remove_item(L, LUA_GLOBALSINDEX, key);
@@ -323,6 +335,7 @@ bool hs_load_sandbox_config(const char *dir,
     cfg->ticker_interval = dflt->ticker_interval;
     cfg->ticker_sync = dflt->ticker_sync;
     cfg->preserve_data = dflt->preserve_data;
+    cfg->restricted_headers = dflt->restricted_headers;
   }
 
   int ret = luaL_dostring(L, cfg->cfg_lua);
@@ -388,6 +401,10 @@ bool hs_load_sandbox_config(const char *dir,
                       &cfg->preserve_data);
   if (ret) goto cleanup;
 
+  ret = get_bool_item(L, LUA_GLOBALSINDEX, cfg_sb_restricted_headers,
+                      &cfg->restricted_headers);
+  if (ret) goto cleanup;
+
   if (type == 'a' || type == 'o') {
     ret = get_string_item(L, LUA_GLOBALSINDEX, cfg_sb_matcher,
                           &cfg->message_matcher, NULL);
@@ -451,6 +468,10 @@ int hs_load_config(const char *fn, hs_config *cfg)
 
   ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_backpressure,
                          &cfg->backpressure);
+  if (ret) goto cleanup;
+
+  ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_backpressure_df,
+                         &cfg->backpressure_df);
   if (ret) goto cleanup;
 
   ret = get_string_item(L, LUA_GLOBALSINDEX, cfg_load_path, &cfg->load_path,
@@ -557,12 +578,12 @@ int hs_process_load_cfg(const char *lpath, const char *rpath, const char *name)
 {
   if (hs_has_ext(name, hs_cfg_ext)) {
     char cfg_lpath[HS_MAX_PATH];
-    if (!hs_get_fqfn(lpath, name, cfg_lpath, sizeof(cfg_lpath))) {
+    if (hs_get_fqfn(lpath, name, cfg_lpath, sizeof(cfg_lpath))) {
       hs_log(NULL, g_module, 0, "load cfg path too long");
       exit(EXIT_FAILURE);
     }
     char cfg_rpath[HS_MAX_PATH];
-    if (!hs_get_fqfn(rpath, name, cfg_rpath, sizeof(cfg_rpath))) {
+    if (hs_get_fqfn(rpath, name, cfg_rpath, sizeof(cfg_rpath))) {
       hs_log(NULL, g_module, 0, "run cfg path too long");
       exit(EXIT_FAILURE);
     }
@@ -588,7 +609,7 @@ int hs_process_load_cfg(const char *lpath, const char *rpath, const char *name)
     return 1;
   } else if (hs_has_ext(name, hs_off_ext)) {
     char off_lpath[HS_MAX_PATH];
-    if (!hs_get_fqfn(lpath, name, off_lpath, sizeof(off_lpath))) {
+    if (hs_get_fqfn(lpath, name, off_lpath, sizeof(off_lpath))) {
       hs_log(NULL, g_module, 0, "load off path too long");
       exit(EXIT_FAILURE);
     }
@@ -600,7 +621,7 @@ int hs_process_load_cfg(const char *lpath, const char *rpath, const char *name)
 
     // move the current cfg to .off and shutdown the plugin
     char off_rpath[HS_MAX_PATH];
-    if (!hs_get_fqfn(rpath, name, off_rpath, sizeof(off_rpath))) {
+    if (hs_get_fqfn(rpath, name, off_rpath, sizeof(off_rpath))) {
       hs_log(NULL, g_module, 0, "run off path too long");
       exit(EXIT_FAILURE);
     }
@@ -627,6 +648,7 @@ bool hs_get_full_config(lsb_output_buffer *ob, char type, const hs_config *cfg,
   lsb_outputf(ob, "-- Hindsight defaults and overrides\n");
   lsb_outputf(ob, "Hostname = [[%s]]\n", cfg->hostname);
   lsb_outputf(ob, "Pid = %d\n", cfg->pid);
+  lsb_outputf(ob, "log_level = %d\n", hs_get_log_level());
   if (type == 'a') {
     lsb_outputf(ob, "path = [[%s]]\n", cfg->analysis_lua_path);
     lsb_outputf(ob, "cpath = [[%s]]\n", cfg->analysis_lua_cpath);
@@ -649,7 +671,8 @@ bool hs_get_full_config(lsb_output_buffer *ob, char type, const hs_config *cfg,
   lsb_outputf(ob, "ticker_interval = %u\n", sbc->ticker_interval);
   lsb_outputf(ob, "preserve_data = %s\n",
               sbc->preserve_data ? "true" : "false");
-  lsb_outputf(ob, "log_level = %d\n", hs_get_log_level());
+  lsb_outputf(ob, "restricted_headers = %s\n",
+              sbc->restricted_headers ? "true" : "false");
 
   if (type == 'a') {
     lsb_outputf(ob, "thread = %u\n", sbc->thread);
