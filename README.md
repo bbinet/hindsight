@@ -9,7 +9,10 @@ guarantees to replace [Heka](https://github.com/mozilla-services/heka).
 Hindsight is that light weight skeleton around the same lua sandbox offering
 'at least once' delivery semantics.
 
-[Full Documentation](docs/index.md)
+* [Full Documentation](docs/index.md)
+* Support
+    * IRC: [#hindsight on irc.mozilla.org](irc://irc.mozilla.org/hindsight)
+    * Mailing list: https://mail.mozilla.org/listinfo/hindsight
 
 ## Build
 
@@ -21,7 +24,7 @@ Hindsight is that light weight skeleton around the same lua sandbox offering
 
 ### CMake Build Instructions
 
-    git clone git@github.com:mozilla-services/hindsight.git
+    git clone https://github.com/mozilla-services/hindsight.git
     cd hindsight 
     mkdir release
     cd release

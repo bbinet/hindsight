@@ -86,10 +86,9 @@ int main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
-  if (cfg.rm_checkpoint) {
-    hs_cleanup_checkpoints(&cfg.cp_reader, cfg.run_path,
-                           cfg.analysis_threads);
-  }
+  hs_checkpoint_reader cpr;
+  hs_init_checkpoint_reader(&cpr, cfg.output_path);
+  hs_cleanup_checkpoints(&cpr, cfg.run_path, cfg.analysis_threads);
 
   hs_log(NULL, g_module, 6, "starting");
   sigset_t signal_set;
@@ -105,17 +104,17 @@ int main(int argc, char *argv[])
   }
 
   hs_input_plugins ips;
-  hs_init_input_plugins(&ips, &cfg);
-  hs_load_input_plugins(&ips, &cfg, false);
+  hs_init_input_plugins(&ips, &cfg, &cpr);
+  hs_load_input_plugins(&ips, false);
 
   hs_analysis_plugins aps;
-  hs_init_analysis_plugins(&aps, &cfg);
-  hs_load_analysis_plugins(&aps, &cfg, false);
+  hs_init_analysis_plugins(&aps, &cfg, &cpr);
+  hs_load_analysis_plugins(&aps, false);
   hs_start_analysis_threads(&aps);
 
   hs_output_plugins ops;
-  hs_init_output_plugins(&ops, &cfg);
-  hs_load_output_plugins(&ops, &cfg, false);
+  hs_init_output_plugins(&ops, &cfg, &cpr);
+  hs_load_output_plugins(&ops, false);
 
   hs_checkpoint_writer cpw;
   hs_init_checkpoint_writer(&cpw, &ips, &aps, &ops, cfg.output_path);
@@ -133,13 +132,13 @@ int main(int argc, char *argv[])
       sem_post(&g_shutdown);
       break; // shutting down
     }
-    hs_write_checkpoints(&cpw, &cfg.cp_reader);
+    hs_write_checkpoints(&cpw, &cpr);
     if (cfg.load_path[0] != 0 && ++cnt == cfg.load_interval) {
       // scan just before emitting the stats
       hs_log(NULL, g_module, 7, "scan load directories");
-      hs_load_input_plugins(&ips, &cfg, true);
-      hs_load_analysis_plugins(&aps, &cfg, true);
-      hs_load_output_plugins(&ops, &cfg, true);
+      hs_load_input_plugins(&ips, true);
+      hs_load_analysis_plugins(&aps, true);
+      hs_load_output_plugins(&ops, true);
       cnt = 0;
     }
 #ifdef HINDSIGHT_CLI
@@ -154,17 +153,17 @@ int main(int argc, char *argv[])
 #ifdef HINDSIGHT_CLI
   hs_stop_input_plugins(&ips);
   hs_wait_input_plugins(&ips);
-  hs_write_checkpoints(&cpw, &cfg.cp_reader);
+  hs_write_checkpoints(&cpw, &cpr);
   hs_free_input_plugins(&ips);
 
   hs_stop_analysis_plugins(&aps);
   hs_wait_analysis_plugins(&aps);
-  hs_write_checkpoints(&cpw, &cfg.cp_reader);
+  hs_write_checkpoints(&cpw, &cpr);
   hs_free_analysis_plugins(&aps);
 
   hs_stop_output_plugins(&ops);
   hs_wait_output_plugins(&ops);
-  hs_write_checkpoints(&cpw, &cfg.cp_reader);
+  hs_write_checkpoints(&cpw, &cpr);
   hs_free_output_plugins(&ops);
 #else
   // non CLI mode should shut everything down immediately
@@ -176,7 +175,7 @@ int main(int argc, char *argv[])
   hs_wait_analysis_plugins(&aps);
   hs_wait_output_plugins(&ops);
 
-  hs_write_checkpoints(&cpw, &cfg.cp_reader);
+  hs_write_checkpoints(&cpw, &cpr);
 
   hs_free_input_plugins(&ips);
   hs_free_analysis_plugins(&aps);
@@ -184,6 +183,7 @@ int main(int argc, char *argv[])
 #endif
 
   hs_free_checkpoint_writer(&cpw);
+  hs_free_checkpoint_reader(&cpr);
   hs_free_config(&cfg);
 
   pthread_join(sig_thread, NULL);

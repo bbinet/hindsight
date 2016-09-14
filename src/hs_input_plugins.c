@@ -104,7 +104,6 @@ static int inject_message(void *parent,
                           const char *cp_string)
 {
   static bool backpressure = false;
-  static size_t bytes_written = 0;
   static char header[14];
 
   hs_input_plugin *p = parent;
@@ -137,26 +136,22 @@ static int inject_message(void *parent,
   header[3 + len] = 0x1f;
   if (fwrite(header, 4 + len, 1, p->plugins->output.fh) == 1
       && fwrite(pb, pb_len, 1, p->plugins->output.fh) == 1) {
-    bytes_written += tlen;
-    if (bytes_written > BUFSIZ) {
-      p->plugins->output.cp.offset += bytes_written;
-      bytes_written = 0;
-      if (p->plugins->output.cp.offset >= p->plugins->cfg->output_size) {
-        ++p->plugins->output.cp.id;
-        hs_open_output_file(&p->plugins->output);
-        if (p->plugins->cfg->backpressure
-            && p->plugins->output.cp.id - p->plugins->output.min_cp_id
-            > p->plugins->cfg->backpressure) {
+    p->plugins->output.cp.offset += tlen;
+    if (p->plugins->output.cp.offset >= p->plugins->cfg->output_size) {
+      ++p->plugins->output.cp.id;
+      hs_open_output_file(&p->plugins->output);
+      if (p->plugins->cfg->backpressure
+          && p->plugins->output.cp.id - p->plugins->output.min_cp_id
+          > p->plugins->cfg->backpressure) {
+        backpressure = true;
+        hs_log(NULL, g_module, 4, "applying backpressure (checkpoint)");
+      }
+      if (!backpressure && p->plugins->cfg->backpressure_df) {
+        unsigned df = hs_disk_free_ob(p->plugins->output.path,
+                                      p->plugins->cfg->output_size);
+        if (df <= p->plugins->cfg->backpressure_df) {
           backpressure = true;
-          hs_log(NULL, g_module, 4, "applying backpressure (checkpoint)");
-        }
-        if (!backpressure && p->plugins->cfg->backpressure_df) {
-          unsigned df = hs_disk_free_ob(p->plugins->output.path,
-                                        p->plugins->cfg->output_size);
-          if (df <= p->plugins->cfg->backpressure_df) {
-            backpressure = true;
-            hs_log(NULL, g_module, 4, "applying backpressure (disk)");
-          }
+          hs_log(NULL, g_module, 4, "applying backpressure (disk)");
         }
       }
     }
@@ -333,6 +328,10 @@ static void* input_thread(void *arg)
         }
         break; // exit
       } else {  // poll
+        pthread_mutex_lock(&p->cp.lock);
+        p->stats = lsb_heka_get_stats(p->hsb);
+        pthread_mutex_unlock(&p->cp.lock);
+
         if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
           hs_log(NULL, p->name, 3, "clock_gettime failed");
           ts.tv_sec = time(NULL);
@@ -359,7 +358,7 @@ static void* input_thread(void *arg)
   hs_input_plugins *plugins = p->plugins;
   // hold the current checkpoint in memory until we shutdown to facilitate
   // resuming where it left off
-  hs_update_checkpoint(&plugins->cfg->cp_reader, p->name, &p->cp);
+  hs_update_checkpoint(plugins->cpr, p->name, &p->cp);
 
   if (shutdown) {
     hs_log(NULL, p->name, 6, "shutting down");
@@ -367,9 +366,6 @@ static void* input_thread(void *arg)
   } else {
     hs_log(NULL, p->name, 6, "detaching received: %d msg: %s", ret,
            lsb_heka_get_error(p->hsb));
-    if (plugins->cfg->rm_checkpoint) {
-      hs_remove_checkpoint(&plugins->cfg->cp_reader, p->name);
-    }
     pthread_mutex_lock(&plugins->list_lock);
     plugins->list[p->list_index] = NULL;
     if (pthread_detach(p->thread)) {
@@ -401,14 +397,14 @@ static bool join_thread(hs_input_plugins *plugins, hs_input_plugin *p)
       if (!sem_trywait(&p->shutdown)) {
         p->orphaned = true;
         hs_log(NULL, p->name, 3, "sandbox did not respond to a forced stop "
-                                 "(orphaning)");
+               "(orphaning)");
         sem_post(&p->shutdown);
         return false;
       } else {
         ts.tv_sec += 1;
         if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
           hs_log(NULL, p->name, 2, "sandbox acknowledged the stop but failed "
-                                   "to stop (undefined behavior)");
+                 "to stop (undefined behavior)");
           return false;
         }
       }
@@ -444,14 +440,7 @@ static bool remove_from_input_plugins(hs_input_plugins *plugins,
 
     char *pos = plugins->list[i]->name + tlen;
     if (strstr(name, pos) && strlen(pos) == strlen(name) - HS_EXT_LEN) {
-      if ((removed = remove_plugin(plugins, i))) {
-        if (plugins->cfg->rm_checkpoint) {
-          char key[HS_MAX_PATH];
-          snprintf(key, HS_MAX_PATH, "%s.%.*s", hs_input_dir,
-                   (int)strlen(name) - HS_EXT_LEN, name);
-          hs_remove_checkpoint(&plugins->cfg->cp_reader, key);
-        }
-      }
+      removed = remove_plugin(plugins, i);
       break;
     }
   }
@@ -509,7 +498,7 @@ static bool add_to_input_plugins(hs_input_plugins *plugins, hs_input_plugin *p)
   pthread_mutex_unlock(&plugins->list_lock);
   assert(p->list_index >= 0);
 
-  hs_lookup_checkpoint(&p->plugins->cfg->cp_reader, p->name, &p->cp);
+  hs_lookup_checkpoint(p->plugins->cpr, p->name, &p->cp);
 
   int ret = pthread_create(&p->thread,
                            NULL,
@@ -523,10 +512,13 @@ static bool add_to_input_plugins(hs_input_plugins *plugins, hs_input_plugin *p)
 }
 
 
-void hs_init_input_plugins(hs_input_plugins *plugins, hs_config *cfg)
+void hs_init_input_plugins(hs_input_plugins *plugins,
+                           hs_config *cfg,
+                           hs_checkpoint_reader *cpr)
 {
   hs_init_output(&plugins->output, cfg->output_path, hs_input_dir);
   plugins->cfg = cfg;
+  plugins->cpr = cpr;
   plugins->list_cnt = 0;
   plugins->list = NULL;
   plugins->list_cap = 0;
@@ -629,9 +621,9 @@ static void process_lua(hs_input_plugins *plugins, const char *lpath,
 }
 
 
-void hs_load_input_plugins(hs_input_plugins *plugins, const hs_config *cfg,
-                           bool dynamic)
+void hs_load_input_plugins(hs_input_plugins *plugins, bool dynamic)
 {
+  hs_config *cfg = plugins->cfg;
   char lpath[HS_MAX_PATH];
   char rpath[HS_MAX_PATH];
   if (hs_get_fqfn(cfg->load_path, hs_input_dir, lpath, sizeof(lpath))) {

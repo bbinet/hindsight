@@ -43,7 +43,6 @@ static const char *cfg_hostname = "hostname";
 static const char *cfg_backpressure = "backpressure";
 static const char *cfg_load_interval = "sandbox_load_interval";
 static const char *cfg_backpressure_df = "backpressure_disk_free";
-static const char *cfg_rm_checkpoint = "remove_checkpoint_on_stop";
 
 static const char *cfg_sb_ipd = "input_defaults";
 static const char *cfg_sb_apd = "analysis_defaults";
@@ -59,6 +58,7 @@ static const char *cfg_sb_ticker_sync = "ticker_sync";
 static const char *cfg_sb_thread = "thread";
 static const char *cfg_sb_async_buffer = "async_buffer_size";
 static const char *cfg_sb_matcher = "message_matcher";
+static const char *cfg_sb_rm_cp_terminate = "remove_checkpoints_on_terminate";
 
 static void init_sandbox_config(hs_sandbox_config *cfg)
 {
@@ -67,6 +67,7 @@ static void init_sandbox_config(hs_sandbox_config *cfg)
   cfg->instruction_limit = 1000000;
   cfg->preserve_data = false;
   cfg->restricted_headers = true;
+  cfg->rm_cp_terminate = false;
   cfg->dir = NULL;
   cfg->filename = NULL;
   cfg->cfg_name = NULL;
@@ -95,7 +96,6 @@ static void init_config(hs_config *cfg)
   cfg->max_message_size = 1024 * 64;
   cfg->backpressure = 0;
   cfg->backpressure_df = 4;
-  cfg->rm_checkpoint = false;
   cfg->pid = (int)getpid();
   init_sandbox_config(&cfg->ipd);
   init_sandbox_config(&cfg->apd);
@@ -167,8 +167,8 @@ static int get_numeric_item(lua_State *L, int idx, const char *name,
   switch (t) {
   case LUA_TNUMBER:
     d = lua_tonumber(L, -1);
-    if (d < 0) {
-      lua_pushfstring(L, "%s must be set to a positive number", name);
+    if (d < 0 || d > UINT_MAX) {
+      lua_pushfstring(L, "%s must be an unsigned int", name);
       return 1;
     }
     *val = (unsigned)d;
@@ -233,6 +233,13 @@ static int load_sandbox_defaults(lua_State *L,
     return 1;
   }
 
+  if (strcmp(key, cfg_sb_opd) == 0) {
+    if (get_bool_item(L, 1, cfg_sb_rm_cp_terminate,
+                      &cfg->rm_cp_terminate)) {
+      return 1;
+    }
+  }
+
   if (check_for_unknown_options(L, 1, key)) return 1;
 
   remove_item(L, LUA_GLOBALSINDEX, key);
@@ -288,8 +295,6 @@ void hs_free_config(hs_config *cfg)
   hs_free_sandbox_config(&cfg->ipd);
   hs_free_sandbox_config(&cfg->apd);
   hs_free_sandbox_config(&cfg->opd);
-
-  hs_free_checkpoint_reader(&cfg->cp_reader);
 }
 
 
@@ -336,6 +341,7 @@ bool hs_load_sandbox_config(const char *dir,
     cfg->ticker_sync = dflt->ticker_sync;
     cfg->preserve_data = dflt->preserve_data;
     cfg->restricted_headers = dflt->restricted_headers;
+    cfg->rm_cp_terminate = dflt->rm_cp_terminate;
   }
 
   int ret = luaL_dostring(L, cfg->cfg_lua);
@@ -420,6 +426,10 @@ bool hs_load_sandbox_config(const char *dir,
   if (type == 'o') {
     ret = get_numeric_item(L, LUA_GLOBALSINDEX, cfg_sb_async_buffer,
                            &cfg->async_buffer_size);
+    if (ret) goto cleanup;
+
+    ret = get_bool_item(L, LUA_GLOBALSINDEX, cfg_sb_rm_cp_terminate,
+                        &cfg->rm_cp_terminate);
     if (ret) goto cleanup;
   }
 
@@ -531,10 +541,6 @@ int hs_load_config(const char *fn, hs_config *cfg)
   }
   if (ret) goto cleanup;
 
-  ret = get_bool_item(L, LUA_GLOBALSINDEX, cfg_rm_checkpoint,
-                      &cfg->rm_checkpoint);
-  if (ret) goto cleanup;
-
   ret = load_sandbox_defaults(L, cfg_sb_ipd, &cfg->ipd);
   if (ret) goto cleanup;
 
@@ -546,8 +552,6 @@ int hs_load_config(const char *fn, hs_config *cfg)
 
   ret = check_for_unknown_options(L, LUA_GLOBALSINDEX, NULL);
   if (ret) goto cleanup;
-
-  hs_init_checkpoint_reader(&cfg->cp_reader, cfg->output_path);
 
 cleanup:
   if (ret) {
@@ -684,6 +688,17 @@ bool hs_get_full_config(lsb_output_buffer *ob, char type, const hs_config *cfg,
 
   // just test the last write to make sure the buffer wasn't exhausted
   lsb_err_value ret = lsb_outputf(ob, "-- end Hindsight configuration\n");
+
+  char fcfg[] = ".fcfg";
+  char fn[strlen(sbc->dir) + 1 + strlen(sbc->cfg_name) + sizeof(fcfg)];
+  char *p = strchr(sbc->cfg_name, '.');
+  if (!p) return false;
+  snprintf(fn, sizeof(fn), "%s/%s%s", sbc->dir, p + 1, fcfg);
+  FILE* fh = fopen(fn, "we");
+  if (!fh) return false;
+  fwrite(ob->buf, ob->pos, 1, fh);
+  fclose(fh);
+
   return ret ? false : true;
 }
 
