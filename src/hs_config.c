@@ -57,6 +57,7 @@ static const char *cfg_sb_preserve = "preserve_data";
 static const char *cfg_sb_restricted_headers = "restricted_headers";
 static const char *cfg_sb_filename = "filename";
 static const char *cfg_sb_ticker_interval = "ticker_interval";
+static const char *cfg_sb_ticker_sync = "ticker_sync";
 static const char *cfg_sb_thread = "thread";
 static const char *cfg_sb_async_buffer = "async_buffer_size";
 static const char *cfg_sb_matcher = "message_matcher";
@@ -80,6 +81,7 @@ static void init_sandbox_config(hs_sandbox_config *cfg)
   cfg->memory_limit = 1024 * 1024 * 8;
   cfg->instruction_limit = 1000000;
   cfg->ticker_interval = 0;
+  cfg->ticker_sync = 0;
 
   cfg->preserve_data = false;
   cfg->restricted_headers = true;
@@ -270,6 +272,9 @@ static int load_sandbox_defaults(lua_State *L,
   if (get_unsigned_int(L, 1, cfg_sb_ticker_interval, &cfg->ticker_interval)) {
     return 1;
   }
+  if (get_unsigned_int(L, 1, cfg_sb_ticker_sync, &cfg->ticker_sync)) {
+    return 1;
+  }
   if (get_bool_item(L, 1, cfg_sb_preserve, &cfg->preserve_data)) return 1;
 
   if (get_bool_item(L, 1, cfg_sb_restricted_headers,
@@ -434,6 +439,7 @@ bool hs_load_sandbox_config(const char *dir,
     cfg->memory_limit = dflt->memory_limit;
     cfg->instruction_limit = dflt->instruction_limit;
     cfg->ticker_interval = dflt->ticker_interval;
+    cfg->ticker_sync = dflt->ticker_sync;
     cfg->preserve_data = dflt->preserve_data;
     cfg->restricted_headers = dflt->restricted_headers;
     cfg->shutdown_terminate = dflt->shutdown_terminate;
@@ -481,6 +487,10 @@ bool hs_load_sandbox_config(const char *dir,
 
   ret = get_unsigned_int(L, LUA_GLOBALSINDEX, cfg_sb_ticker_interval,
                          &cfg->ticker_interval);
+  if (ret) goto cleanup;
+
+  ret = get_unsigned_int(L, LUA_GLOBALSINDEX, cfg_sb_ticker_sync,
+                         &cfg->ticker_sync);
   if (ret) goto cleanup;
 
   ret = get_string_item(L, LUA_GLOBALSINDEX, cfg_sb_filename, &cfg->filename,
@@ -834,6 +844,7 @@ bool hs_output_runtime_cfg(lsb_output_buffer *ob, char type, const hs_config *cf
   lsb_outputf(ob, "memory_limit = %u\n", sbc->memory_limit);
   lsb_outputf(ob, "instruction_limit = %u\n", sbc->instruction_limit);
   lsb_outputf(ob, "ticker_interval = %u\n", sbc->ticker_interval);
+  lsb_outputf(ob, "ticker_sync = %u\n", sbc->ticker_sync);
   lsb_outputf(ob, "preserve_data = %s\n",
               sbc->preserve_data ? "true" : "false");
   lsb_outputf(ob, "restricted_headers = %s\n",

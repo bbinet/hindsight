@@ -121,9 +121,20 @@ create_output_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
   p->read_queue = sbc->read_queue;
   p->shutdown_terminate = sbc->shutdown_terminate;
   int stagger = p->ticker_interval > 60 ? 60 : p->ticker_interval;
+  time_t now = time(NULL);
   // distribute when the timer_events will fire
   if (stagger) {
-    p->ticker_expires = time(NULL) + rand() % stagger;
+    switch (sbc->ticker_sync) {
+    case 1: // sync ticker_interval on epoch number
+      p->ticker_expires = now + p->ticker_interval - now % p->ticker_interval;
+      break;
+    case 2: // don't sync ticker_interval: use current time
+      p->ticker_expires = now + p->ticker_interval;
+      break;
+    default: // random sync (the default)
+      p->ticker_expires = now + rand() % stagger;
+      break;
+    }
 #ifdef HINDSIGHT_CLI
     p->ticker_expires = 0;
 #endif
@@ -291,7 +302,7 @@ static int output_message(hs_output_plugin *p, lsb_heka_message *msg,
   if (ret <= 0 && p->ticker_interval
       && current_t >= p->ticker_expires) {
     te_ret = lsb_heka_timer_event(p->hsb, current_t, false);
-    p->ticker_expires = current_t + p->ticker_interval;
+    p->ticker_expires = p->ticker_expires + p->ticker_interval;
   }
 
   if (ret > 0 || te_ret > 0) {
