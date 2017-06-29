@@ -42,6 +42,7 @@ typedef struct hs_sandbox_config
   unsigned memory_limit;
   unsigned instruction_limit;
   unsigned ticker_interval;
+  unsigned ticker_sync;
 
   bool preserve_data;
   bool restricted_headers;
