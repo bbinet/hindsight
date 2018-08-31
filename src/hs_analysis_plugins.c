@@ -428,7 +428,11 @@ static void analyze_message(hs_analysis_thread *at, bool sample)
     if (ret <= 0 && p->ticker_interval && at->current_t >= p->ticker_expires) {
       p->im_limit = p->te_im_limit;
       ret = lsb_heka_timer_event(p->hsb, at->current_t, false);
+#ifdef HINDSIGHT_CLI
+      p->ticker_expires = at->current_t + p->ticker_interval;
+#else
       p->ticker_expires = p->ticker_expires + p->ticker_interval;
+#endif
     }
 
     if (sample) p->stats = lsb_heka_get_stats(p->hsb);

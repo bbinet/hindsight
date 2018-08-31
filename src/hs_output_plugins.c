@@ -394,7 +394,11 @@ static int output_message(hs_output_plugin *p, lsb_heka_message *msg,
   if (ret <= 0 && p->ticker_interval
       && current_t >= p->ticker_expires) {
     te_ret = lsb_heka_timer_event(p->hsb, current_t, false);
-    p->ticker_expires = p->ticker_expires + p->ticker_interval;
+#ifdef HINDSIGHT_CLI
+      p->ticker_expires = current_t + p->ticker_interval;
+#else
+      p->ticker_expires = p->ticker_expires + p->ticker_interval;
+#endif
   }
 
   if (sample) {
