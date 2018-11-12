@@ -446,12 +446,6 @@ bool hs_load_sandbox_config(const char *dir,
     if (hs_get_fqfn(dir, fn, fqfn, sizeof(fqfn))) {
       return false;
     }
-  } else if (hs_has_ext(fn, hs_err_ext) || hs_has_ext(fn, hs_rtc_ext)) {
-    // todo the rtc check can be removed after the migration Issue #128
-    if (!hs_get_fqfn(dir, fn, fqfn, sizeof(fqfn))) {
-      unlink(fqfn);
-    }
-    return false;
   } else {
     return false;
   }
@@ -481,17 +475,7 @@ bool hs_load_sandbox_config(const char *dir,
     cfg->read_queue = dflt->read_queue;
   }
 
-  int ret = luaL_dostring(L, cfg->cfg_lua);
-  if (ret) goto cleanup;
-
-  size_t len = strlen(dir) + 1;
-  cfg->dir = malloc(len);
-  if (!cfg->dir) {
-    ret = 1;
-    goto cleanup;
-  }
-  memcpy(cfg->dir, dir, len);
-
+  int ret = 0;
   if (type == 'i') {
     cfg->cfg_name = create_name("input", fn);
   } else if (type == 'o') {
@@ -504,6 +488,17 @@ bool hs_load_sandbox_config(const char *dir,
     ret = 1;
     goto cleanup;
   }
+
+  size_t len = strlen(dir) + 1;
+  cfg->dir = malloc(len);
+  if (!cfg->dir) {
+    ret = 1;
+    goto cleanup;
+  }
+  memcpy(cfg->dir, dir, len);
+
+  ret = luaL_dostring(L, cfg->cfg_lua);
+  if (ret) goto cleanup;
 
   ret = get_unsigned_int(L, LUA_GLOBALSINDEX, cfg_sb_output,
                          &cfg->output_limit);
@@ -584,6 +579,13 @@ bool hs_load_sandbox_config(const char *dir,
 cleanup:
   if (ret) {
     hs_log(NULL, g_module, 3, "loading %s failed: %s", fn, lua_tostring(L, -1));
+    if (cfg->dir && cfg->cfg_name) {
+      char *pos = strrchr(cfg->dir, '/');
+      if (pos) {
+        *pos = 0;
+        hs_save_termination_err(cfg->dir, cfg->cfg_name, lua_tostring(L, -1));
+      }
+    }
     hs_free_sandbox_config(cfg);
     return false;
   }

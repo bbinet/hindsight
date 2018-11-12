@@ -28,7 +28,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "hs_logger.h"
 #include "hs_util.h"
 
 static const char g_module[] = "input_plugins";
@@ -51,11 +50,13 @@ static void free_ip_checkpoint(hs_ip_checkpoint *cp)
 {
   if (!cp) return;
 
-  cp->type = HS_CP_NONE;
   if (cp->type == HS_CP_STRING) {
     free(cp->value.s);
     cp->value.s = NULL;
+    cp->len = 0;
+    cp->cap = 0;
   }
+  cp->type = HS_CP_NONE;
   pthread_mutex_destroy(&cp->lock);
 }
 
@@ -105,6 +106,7 @@ static int inject_message(void *parent,
                           double cp_numeric,
                           const char *cp_string)
 {
+  static time_t last_bp_check = 0;
   static bool backpressure = false;
   static char header[14];
 
@@ -123,8 +125,8 @@ static int inject_message(void *parent,
 
   if (!pb) { // a NULL message is used as a synchronization point
     if (!sem_trywait(&p->shutdown)) {
-      sem_post(&p->shutdown);
       lsb_heka_stop_sandbox_clean(p->hsb);
+      sem_post(&p->shutdown);
     }
     return rv;
   }
@@ -160,7 +162,8 @@ static int inject_message(void *parent,
         }
       }
     }
-    if (backpressure) {
+    if (backpressure && last_bp_check < time(NULL)) {
+      last_bp_check = time(NULL);
       bool release_dfbp = true;
       if (p->plugins->cfg->backpressure_df) {
         unsigned df = hs_disk_free_ob(p->plugins->output.path,
@@ -245,6 +248,8 @@ create_input_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
     destroy_input_plugin(p);
   }
   memcpy(p->name, sbc->cfg_name, len);
+  p->ctx.plugin_name = p->name;
+  p->ctx.output_path = cfg->run_path;
 
   char *state_file = NULL;
   if (sbc->preserve_data) {
@@ -282,9 +287,13 @@ create_input_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
     destroy_input_plugin(p);
     return NULL;
   }
-  lsb_logger logger = { .context = NULL, .cb = hs_log };
+  lsb_logger logger = { .context = &p->ctx, .cb = hs_log };
   p->hsb = lsb_heka_create_input(p, lua_file, state_file, ob.buf, &logger,
                                  inject_message);
+  if (!p->hsb && hs_is_bad_state(cfg->run_path, p->name, state_file)) {
+    p->hsb = lsb_heka_create_input(p, lua_file, state_file, ob.buf, &logger,
+                                   inject_message);
+  }
   lsb_free_output_buffer(&ob);
   free(sbc->cfg_lua);
   sbc->cfg_lua = NULL;
@@ -294,9 +303,22 @@ create_input_plugin(const hs_config *cfg, hs_sandbox_config *sbc)
     hs_log(NULL, g_module, 3, "%s lsb_heka_create_input failed", sbc->cfg_name);
     return NULL;
   }
-
+  p->ctx.plugin_name = NULL;
+  p->ctx.output_path = NULL;
   init_ip_checkpoint(&p->cp);
   return p;
+}
+
+
+static struct timespec get_current_timespec(const char *name)
+{
+  struct timespec ts;
+  if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+    hs_log(NULL, name, 3, "clock_gettime failed");
+    ts.tv_sec = time(NULL);
+    ts.tv_nsec = 0;
+  }
+  return ts;
 }
 
 
@@ -337,12 +359,14 @@ static void* input_thread(void *arg)
         pthread_mutex_lock(&p->cp.lock);
         p->stats = lsb_heka_get_stats(p->hsb);
         pthread_mutex_unlock(&p->cp.lock);
-
-        if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-          hs_log(NULL, p->name, 3, "clock_gettime failed");
-          ts.tv_sec = time(NULL);
-          ts.tv_nsec = 0;
+        if (ret == LSB_HEKA_PM_FAIL) {
+          const char *err = lsb_heka_get_error(p->hsb);
+          if (strlen(err) > 0) {
+            hs_log(NULL, p->name, 4, "process_message returned: %d %s", ret,
+                   err);
+          }
         }
+        ts = get_current_timespec(p->name);
         ts.tv_sec += p->ticker_interval;
         if (!sem_timedwait(&p->shutdown, &ts)) {
           shutdown = true;
@@ -357,9 +381,9 @@ static void* input_thread(void *arg)
     }
   }
 
-  if (p->orphaned) {
-    pthread_exit(NULL);
-  }
+  pthread_testcancel();
+  int oldstate = 0;
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
 
   hs_input_plugins *plugins = p->plugins;
   // hold the current checkpoint in memory until we shutdown to facilitate
@@ -368,12 +392,11 @@ static void* input_thread(void *arg)
 
   if (shutdown) {
     hs_log(NULL, p->name, 6, "shutting down");
-    sem_post(&p->shutdown);
   } else {
     const char *err = lsb_heka_get_error(p->hsb);
     hs_log(NULL, p->name, 6, "detaching received: %d msg: %s", ret, err);
     if (ret > 0) {
-      hs_save_termination_err(plugins->cfg, p->name, err);
+      hs_save_termination_err(plugins->cfg->run_path, p->name, err);
     }
     pthread_mutex_lock(&plugins->list_lock);
 #ifdef HINDSIGHT_CLI
@@ -395,42 +418,34 @@ static void* input_thread(void *arg)
 }
 
 
-static bool join_thread(hs_input_plugins *plugins, hs_input_plugin *p)
+static bool join_thread(hs_input_plugins *plugins, hs_input_plugin *p,
+                        struct timespec ts)
 {
-  struct timespec ts;
-  if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-    hs_log(NULL, p->name, 3, "clock_gettime failed");
-    ts.tv_sec = time(NULL);
-    ts.tv_nsec = 0;
-  }
-
-  ts.tv_sec += 2;
+  ts.tv_sec += 10;
   if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
-    lsb_heka_stop_sandbox(p->hsb);
     hs_log(NULL, p->name, 4, "sandbox did not respond to a clean stop");
+    lsb_heka_stop_sandbox(p->hsb);
+    ts = get_current_timespec(p->name);
     ts.tv_sec += 2;
     if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
-      if (!sem_trywait(&p->shutdown)) {
-        p->orphaned = true;
-        hs_log(NULL, p->name, 3, "sandbox did not respond to a forced stop "
-               "(orphaning)");
-        sem_post(&p->shutdown);
+      hs_log(NULL, p->name, 4, "sandbox did not respond to a forced stop");
+      pthread_cancel(p->thread);
+      ts = get_current_timespec(p->name);
+      ts.tv_sec += 2;
+      if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
+        hs_log(NULL, p->name, 3, "sandbox did not respond to a thread cancel "
+               "(memory leaked)");
         return false;
-      } else {
-        ts.tv_sec += 1;
-        if (pthread_timedjoin_np(p->thread, NULL, &ts)) {
-          hs_log(NULL, p->name, 2, "sandbox acknowledged the stop but failed "
-                 "to stop (undefined behavior)");
-          return false;
-        }
       }
     }
   }
 #ifdef HINDSIGHT_CLI
-  if (!lsb_heka_is_running(p->hsb)) { // todo or !stopped (needs a new sandbox api)
+  int state = lsb_heka_get_state(p->hsb);
+  if (state == LSB_TERMINATED || state == LSB_UNKNOWN) {
     plugins->terminated = true;
   }
 #endif
+  hs_log(NULL, p->name, 7, "destroyed");
   destroy_input_plugin(p);
   --plugins->list_cnt;
   return true;
@@ -441,8 +456,8 @@ static bool remove_plugin(hs_input_plugins *plugins, int idx)
 {
   hs_input_plugin *p = plugins->list[idx];
   sem_post(&p->shutdown);
-  lsb_heka_stop_sandbox_clean(p->hsb);
-  if (join_thread(plugins, p)) {
+  hs_log(NULL, g_module, 7, "shutdown signaled %s", p->name);
+  if (join_thread(plugins, p, get_current_timespec(p->name))) {
     plugins->list[idx] = NULL;
     return true;
   }
@@ -544,13 +559,14 @@ void hs_init_input_plugins(hs_input_plugins *plugins,
 
 void hs_wait_input_plugins(hs_input_plugins *plugins)
 {
+  struct timespec ts = get_current_timespec(g_module);
   pthread_mutex_lock(&plugins->list_lock);
   for (int i = 0; i < plugins->list_cap; ++i) {
     if (!plugins->list[i]) continue;
 
     hs_input_plugin *p = plugins->list[i];
     plugins->list[i] = NULL;
-    join_thread(plugins, p);
+    join_thread(plugins, p, ts);
   }
   pthread_mutex_unlock(&plugins->list_lock);
 }
@@ -634,6 +650,8 @@ void hs_load_input_startup(hs_input_plugins *plugins)
 {
   hs_config *cfg = plugins->cfg;
   const char *dir = cfg->run_path_input;
+  hs_prune_err(dir);
+
   DIR *dp = opendir(dir);
   if (dp == NULL) {
     hs_log(NULL, g_module, 0, "%s: %s", dir, strerror(errno));
@@ -717,6 +735,7 @@ void hs_stop_input_plugins(hs_input_plugins *plugins)
   for (int i = 0; i < plugins->list_cap; ++i) {
     if (!plugins->list[i]) continue;
     sem_post(&plugins->list[i]->shutdown);
+    hs_log(NULL, g_module, 7, "shutdown signaled %s", plugins->list[i]->name);
   }
   pthread_mutex_unlock(&plugins->list_lock);
 }
